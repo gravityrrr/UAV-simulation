@@ -9,3 +9,6 @@ PyYAML>=6.0
 scipy>=1.10.0
 requests>=2.28.0
 noise>=1.2.2
+
+pyqtgraph>=0.13.0
+PyOpenGL>=3.1.6

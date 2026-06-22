@@ -6,10 +6,11 @@ import numpy as np
 from PyQt6.QtWidgets import (QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, 
                              QPushButton, QLabel, QComboBox, QFormLayout, 
                              QGroupBox, QTabWidget, QSpinBox, QDoubleSpinBox, 
-                             QFileDialog, QMessageBox)
-from PyQt6.QtCore import QThread, pyqtSignal, Qt, QTimer
+                             QFileDialog, QMessageBox, QApplication)
+from PyQt6.QtCore import QThread, pyqtSignal, Qt, QTimer, QEvent
 
-from .map_widget import MapWidget
+from .map_widget import MapWidget as MapWidget3D
+from .map_widget_2d import MapWidget2D
 from .plot_widget import TrainingPlotWidget
 from uav_env.env import UAVEnv
 from agents.ppo import PPOAgent
@@ -132,6 +133,9 @@ class MainWindow(QMainWindow):
         
         self._init_ui()
         
+        # Install global event filter to capture WASD even if 3D view is clicked
+        QApplication.instance().installEventFilter(self)
+        
     def _init_ui(self):
         central_widget = QWidget()
         self.setCentralWidget(central_widget)
@@ -212,10 +216,12 @@ class MainWindow(QMainWindow):
         self.tabs = QTabWidget()
         self.tabs.setStyleSheet("QTabWidget::pane { border: 1px solid #333; } QTabBar::tab { background: #222; color: white; padding: 8px; } QTabBar::tab:selected { background: #0078D7; }")
         
-        self.map_widget = MapWidget()
+        self.map_widget_2d = MapWidget2D()
+        self.map_widget_3d = MapWidget3D()
         self.plot_widget = TrainingPlotWidget()
         
-        self.tabs.addTab(self.map_widget, "Environment View")
+        self.tabs.addTab(self.map_widget_3d, "3D Environment")
+        self.tabs.addTab(self.map_widget_2d, "2D Top-Down")
         self.tabs.addTab(self.plot_widget, "Training Metrics")
         
         main_layout.addWidget(control_panel)
@@ -235,8 +241,10 @@ class MainWindow(QMainWindow):
         
         self.worker = TrainingWorker(self.config, agent_type)
         self.worker.update_plot_signal.connect(self.plot_widget.update_plots)
-        self.worker.setup_env_signal.connect(self.map_widget.set_environment)
-        self.worker.update_map_signal.connect(self.map_widget.update_state)
+        self.worker.setup_env_signal.connect(self.map_widget_2d.set_environment)
+        self.worker.setup_env_signal.connect(self.map_widget_3d.set_environment)
+        self.worker.update_map_signal.connect(self.map_widget_2d.update_state)
+        self.worker.update_map_signal.connect(self.map_widget_3d.update_state)
         self.worker.update_stats_signal.connect(self.update_stats_label)
         self.worker.finished_signal.connect(self.all_finished)
         
@@ -266,7 +274,8 @@ class MainWindow(QMainWindow):
             self.config['env']['num_obstacles'] = self.obs_spin.value()
             self.manual_env = UAVEnv(self.config['env'])
             self.manual_env.reset()
-            self.map_widget.set_environment(self.manual_env.heightmap, self.manual_env.obstacles)
+            self.map_widget_2d.set_environment(self.manual_env.heightmap, self.manual_env.obstacles)
+            self.map_widget_3d.set_environment(self.manual_env.heightmap, self.manual_env.obstacles)
             
             self.manual_steps = 0
             self.start_time = time.time()
@@ -280,15 +289,15 @@ class MainWindow(QMainWindow):
             
         action = np.zeros(3)
         # Assuming typical screen coordinates: Y is up/down, X is left/right
-        if Qt.Key.Key_W in self.keys_pressed: action[1] -= 1.0 # Up
-        if Qt.Key.Key_S in self.keys_pressed: action[1] += 1.0 # Down
-        if Qt.Key.Key_A in self.keys_pressed: action[0] -= 1.0 # Left
-        if Qt.Key.Key_D in self.keys_pressed: action[0] += 1.0 # Right
-        if Qt.Key.Key_Q in self.keys_pressed: action[2] += 1.0 # Ascend
-        if Qt.Key.Key_E in self.keys_pressed: action[2] -= 1.0 # Descend
+        if Qt.Key.Key_W.value in self.keys_pressed: action[1] -= 1.0 # Up
+        if Qt.Key.Key_S.value in self.keys_pressed: action[1] += 1.0 # Down
+        if Qt.Key.Key_A.value in self.keys_pressed: action[0] -= 1.0 # Left
+        if Qt.Key.Key_D.value in self.keys_pressed: action[0] += 1.0 # Right
+        if Qt.Key.Key_Q.value in self.keys_pressed: action[2] += 1.0 # Ascend
+        if Qt.Key.Key_E.value in self.keys_pressed: action[2] -= 1.0 # Descend
         
         # Hard Brake
-        if Qt.Key.Key_Space in self.keys_pressed:
+        if Qt.Key.Key_Space.value in self.keys_pressed:
             speed = np.linalg.norm(self.manual_env.uav_vel)
             if speed > 0.1:
                 action -= (self.manual_env.uav_vel / speed) * 1.0 # Oppose velocity fully
@@ -298,26 +307,27 @@ class MainWindow(QMainWindow):
         _, reward, terminated, truncated, info = self.manual_env.step(action)
         self.manual_steps += 1
         
-        self.map_widget.update_state(self.manual_env.uav_pos, self.manual_env.goal_pos, self.manual_env.uav_vel, self.manual_env.trajectory)
+        self.map_widget_2d.update_state(self.manual_env.uav_pos, self.manual_env.goal_pos, self.manual_env.uav_vel, self.manual_env.trajectory)
+        self.map_widget_3d.update_state(self.manual_env.uav_pos, self.manual_env.goal_pos, self.manual_env.uav_vel, self.manual_env.trajectory)
         self.update_stats_label(1, self.manual_steps)
         
         if terminated or truncated:
             self.manual_timer.stop()
             QMessageBox.information(self, "Episode Ended", f"Reason: {info['reason']}")
             self.manual_env.reset()
-            self.map_widget.set_environment(self.manual_env.heightmap, self.manual_env.obstacles)
+            self.map_widget_2d.set_environment(self.manual_env.heightmap, self.manual_env.obstacles)
+            self.map_widget_3d.set_environment(self.manual_env.heightmap, self.manual_env.obstacles)
             self.manual_steps = 0
             self.manual_timer.start(50)
             
-    def keyPressEvent(self, event):
+    def eventFilter(self, obj, event):
         if self.is_manual:
-            self.keys_pressed.add(event.key())
-        super().keyPressEvent(event)
-        
-    def keyReleaseEvent(self, event):
-        if self.is_manual and event.key() in self.keys_pressed:
-            self.keys_pressed.remove(event.key())
-        super().keyReleaseEvent(event)
+            if event.type() == QEvent.Type.KeyPress:
+                self.keys_pressed.add(event.key())
+            elif event.type() == QEvent.Type.KeyRelease:
+                if event.key() in self.keys_pressed:
+                    self.keys_pressed.remove(event.key())
+        return super().eventFilter(obj, event)
         
     def update_stats_label(self, episode, steps):
         elapsed = int(time.time() - self.start_time)

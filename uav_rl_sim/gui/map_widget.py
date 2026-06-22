@@ -1,148 +1,139 @@
 import sys
-# pyrefly: ignore [missing-import]
 import numpy as np
-import cv2
-from PyQt6.QtWidgets import QGraphicsView, QGraphicsScene, QGraphicsPixmapItem, QGraphicsEllipseItem, QGraphicsLineItem
-from PyQt6.QtGui import QPixmap, QImage, QColor, QPen, QBrush, QTransform, QPainter
-from PyQt6.QtCore import Qt, QRectF
-import os
+from PyQt6.QtWidgets import QWidget, QVBoxLayout
+import pyqtgraph as pg
+import pyqtgraph.opengl as gl
 
-class MapWidget(QGraphicsView):
+class MapWidget(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.scene = QGraphicsScene(self)
-        self.setScene(self.scene)
-        self.setRenderHint(QPainter.RenderHint.Antialiasing)
+        self.layout = QVBoxLayout(self)
+        self.layout.setContentsMargins(0, 0, 0, 0)
+        
+        # 3D View Widget
+        self.view = gl.GLViewWidget()
+        self.view.opts['distance'] = 120
+        self.view.opts['elevation'] = 45
+        self.view.opts['azimuth'] = 45
+        self.view.opts['center'] = pg.Vector(50, 50, 0)
+        self.layout.addWidget(self.view)
+        
+        self.view.setBackgroundColor((20, 20, 30)) # Dark sleek background
+        
+        # Add 3D Grid for depth perception
+        self.grid = gl.GLGridItem()
+        self.grid.setSize(150, 150)
+        self.grid.setSpacing(10, 10)
+        self.grid.translate(50, 50, -5)
+        self.view.addItem(self.grid)
         
         self.grid_size = 100
-        self.cell_size = 8 # pixels per grid cell
         
-        # Items
-        self.terrain_item = None
-        self.obstacle_items = []
-        self.uav_item = None
-        self.goal_item = None
-        self.trajectory_lines = []
+        # 3D Items
+        self.surface = None
+        self.obstacle_meshes = []
+        self.uav_mesh = None
+        self.goal_mesh = None
+        self.trajectory_line = None
         
-        # Load Assets
-        self.drone_pixmap = self._load_asset("assets/jet.png", size=32)
-        self.tree_pixmap = self._load_asset("assets/tree.png", size=16)
-        self.custom_colormap = self._create_terrain_colormap()
-        
-    def _create_terrain_colormap(self):
-        colormap = np.zeros((256, 1, 3), dtype=np.uint8)
-        # Keypoints: B, G, R
-        colors = [
-            (0.0, (128, 0, 0)),       # Deep Water
-            (0.1, (255, 128, 0)),     # Shallow Water
-            (0.15, (128, 178, 194)),  # Sand
-            (0.3, (34, 139, 34)),     # Grass
-            (0.7, (19, 69, 139)),     # Rock/Mountain
-            (1.0, (255, 255, 255))    # Snow
-        ]
-        
-        for i in range(256):
-            val = i / 255.0
-            for j in range(len(colors)-1):
-                if colors[j][0] <= val <= colors[j+1][0]:
-                    t = (val - colors[j][0]) / (colors[j+1][0] - colors[j][0] + 1e-6)
-                    c1 = np.array(colors[j][1])
-                    c2 = np.array(colors[j+1][1])
-                    c = c1 * (1 - t) + c2 * t
-                    colormap[i, 0, :] = c.astype(np.uint8)
-                    break
-        return colormap
-        
-    def _load_asset(self, path, size=32):
-        if os.path.exists(path):
-            pix = QPixmap(path)
-            return pix.scaled(size, size, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
-        return None
+        self.trajectory_points = []
         
     def set_environment(self, heightmap, obstacles):
-        self.scene.clear()
-        self.obstacle_items.clear()
-        self.trajectory_lines.clear()
+        self.view.clear()
         
-        self.grid_size = heightmap.shape[0]
+        # 1. Add Terrain Surface
+        z = heightmap
         
-        # 1. Render Terrain Base
-        # Convert heightmap to colormap
-        norm_h = np.clip(heightmap / 30.0, 0, 1) # Normalize roughly
-        colormap_img = cv2.applyColorMap((norm_h * 255).astype(np.uint8), self.custom_colormap)
-        colormap_img = cv2.cvtColor(colormap_img, cv2.COLOR_BGR2RGB)
+        # Calculate colors based on height
+        min_z, max_z = np.min(z), np.max(z)
+        if max_z == min_z:
+            max_z = min_z + 1.0
+            
+        colors = np.zeros((self.grid_size, self.grid_size, 4))
+        for i in range(self.grid_size):
+            for j in range(self.grid_size):
+                norm_z = (z[i, j] - min_z) / (max_z - min_z)
+                # Simple blue -> sand -> green -> rock -> snow colormap
+                if norm_z < 0.2:
+                    colors[i, j] = [0.1, 0.3, 0.8, 1.0] # Water
+                elif norm_z < 0.3:
+                    colors[i, j] = [0.8, 0.8, 0.4, 1.0] # Sand
+                elif norm_z < 0.6:
+                    colors[i, j] = [0.2, 0.6, 0.2, 1.0] # Grass
+                elif norm_z < 0.8:
+                    colors[i, j] = [0.5, 0.5, 0.5, 1.0] # Rock
+                else:
+                    colors[i, j] = [0.9, 0.9, 0.9, 1.0] # Snow
+                    
+        self.surface = gl.GLSurfacePlotItem(z=z, colors=colors, computeNormals=True, smooth=True, shader='shaded')
+        self.surface.scale(1, 1, 1.5)
+        self.surface.translate(-0.5, -0.5, 0)
+        self.view.addItem(self.surface)
         
-        # Scale up
-        colormap_img = cv2.resize(colormap_img, (self.grid_size * self.cell_size, self.grid_size * self.cell_size), interpolation=cv2.INTER_LINEAR)
+        # 2. Add Obstacles (Sleek sci-fi building blocks)
+        for mesh in self.obstacle_meshes:
+            self.view.removeItem(mesh)
+        self.obstacle_meshes.clear()
         
-        h, w, ch = colormap_img.shape
-        bytes_per_line = ch * w
-        qimg = QImage(colormap_img.data, w, h, bytes_per_line, QImage.Format.Format_RGB888)
-        self.terrain_item = self.scene.addPixmap(QPixmap.fromImage(qimg))
-        
-        # 2. Render Obstacles
         for i in range(self.grid_size):
             for j in range(self.grid_size):
                 if obstacles[i, j] > 0:
-                    x = i * self.cell_size
-                    y = j * self.cell_size
-                    if self.tree_pixmap:
-                        item = self.scene.addPixmap(self.tree_pixmap)
-                        # Center the pixmap
-                        item.setPos(x - self.tree_pixmap.width()/2, y - self.tree_pixmap.height()/2)
-                    else:
-                        item = self.scene.addEllipse(x-4, y-4, 8, 8, QPen(Qt.GlobalColor.darkGreen), QBrush(Qt.GlobalColor.green))
-                    self.obstacle_items.append(item)
+                    th = z[i, j]
+                    oh = obstacles[i, j]
+                    height = max(1.0, oh - th)
                     
-        # 3. Add Goal
-        self.goal_item = self.scene.addEllipse(0, 0, 16, 16, QPen(Qt.GlobalColor.red, 2), QBrush(Qt.GlobalColor.yellow))
-        self.goal_item.setZValue(10)
-        
-        # 4. Add UAV
-        if self.drone_pixmap:
-            self.uav_item = self.scene.addPixmap(self.drone_pixmap)
-            self.uav_item.setTransformOriginPoint(self.drone_pixmap.width()/2, self.drone_pixmap.height()/2)
-        else:
-            self.uav_item = self.scene.addEllipse(0, 0, 16, 16, QPen(Qt.GlobalColor.cyan, 2), QBrush(Qt.GlobalColor.blue))
+                    # Create a solid building block
+                    box = gl.GLBoxItem(size=pg.Vector(1.0, 1.0, height * 1.5), color=(80, 100, 120, 255))
+                    box.translate(i - 0.5, j - 0.5, th * 1.5)
+                    self.view.addItem(box)
+                    self.obstacle_meshes.append(box)
             
-        self.uav_item.setZValue(20)
+        # 3. Custom Low-Poly Jet Mesh for UAV
+        verts = np.array([
+            [ 0,  2,  0], # 0 Nose
+            [-1.5, -1,  0], # 1 Left Wing
+            [ 1.5, -1,  0], # 2 Right Wing
+            [ 0, -1,  1], # 3 Tail fin
+            [ 0, -0.5, -0.5]  # 4 Bottom
+        ])
+        faces = np.array([
+            [0, 1, 3], [0, 3, 2], [0, 2, 4], [0, 4, 1],
+            [1, 2, 3], [1, 4, 2]
+        ])
+        jet_md = gl.MeshData(vertexes=verts, faces=faces)
+        self.uav_mesh = gl.GLMeshItem(meshdata=jet_md, smooth=False, color=(0.2, 0.8, 1.0, 1.0), drawEdges=True, edgeColor=(1, 1, 1, 1))
+        self.view.addItem(self.uav_mesh)
         
+        # Goal as a bright Diamond
+        diamond_md = gl.MeshData.sphere(rows=4, cols=4) # low poly sphere looks like diamond
+        self.goal_mesh = gl.GLMeshItem(meshdata=diamond_md, smooth=False, color=(1.0, 0.2, 0.2, 0.8), drawEdges=True, edgeColor=(1, 0, 0, 1))
+        self.view.addItem(self.goal_mesh)
+        
+        # 4. Trajectory
+        self.trajectory_points = []
+        self.trajectory_line = gl.GLLinePlotItem(color=(0, 1, 1, 0.8), width=2, antialias=True)
+        self.view.addItem(self.trajectory_line)
+
     def update_state(self, uav_pos, goal_pos, uav_vel, trajectory):
-        # Update Goal
-        gx = goal_pos[0] * self.cell_size
-        gy = goal_pos[1] * self.cell_size
-        if isinstance(self.goal_item, QGraphicsEllipseItem):
-            self.goal_item.setPos(gx - 8, gy - 8)
-            
-        # Update UAV
-        ux = uav_pos[0] * self.cell_size
-        uy = uav_pos[1] * self.cell_size
+        # Update UAV position and orientation
+        self.uav_mesh.resetTransform()
         
-        if isinstance(self.uav_item, QGraphicsPixmapItem):
-            self.uav_item.setPos(ux - self.drone_pixmap.width()/2, uy - self.drone_pixmap.height()/2)
-            # Rotate based on velocity
-            if np.linalg.norm(uav_vel[:2]) > 0.1:
-                angle = np.degrees(np.arctan2(uav_vel[1], uav_vel[0]))
-                self.uav_item.setRotation(angle + 90) # Adjust based on drone image orientation
-        else:
-            self.uav_item.setPos(ux - 8, uy - 8)
+        # Calculate Heading from velocity (fallback to 0 if stationary)
+        angle = 0
+        if np.linalg.norm(uav_vel[:2]) > 0.1:
+            angle = np.degrees(np.arctan2(uav_vel[1], uav_vel[0]))
             
-        # Draw Trajectory
-        for line in self.trajectory_lines:
-            self.scene.removeItem(line)
-        self.trajectory_lines.clear()
+        self.uav_mesh.scale(1.5, 1.5, 1.5)
+        self.uav_mesh.rotate(angle - 90, 0, 0, 1) # point jet in direction of travel
+        self.uav_mesh.translate(uav_pos[0], uav_pos[1], uav_pos[2] * 1.5)
         
+        # Update Goal position
+        self.goal_mesh.resetTransform()
+        self.goal_mesh.scale(2.5, 2.5, 3.0)
+        self.goal_mesh.translate(goal_pos[0], goal_pos[1], goal_pos[2] * 1.5)
+        
+        # Update Trajectory
         if len(trajectory) > 1:
-            pen = QPen(QColor(0, 255, 255, 150), 2)
-            for i in range(max(0, len(trajectory)-50), len(trajectory)-1):
-                p1 = trajectory[i]
-                p2 = trajectory[i+1]
-                line = self.scene.addLine(
-                    p1[0] * self.cell_size, p1[1] * self.cell_size,
-                    p2[0] * self.cell_size, p2[1] * self.cell_size,
-                    pen
-                )
-                self.trajectory_lines.append(line)
-                
-        # Center view
-        self.centerOn(ux, uy)
+            pts = np.array(trajectory)
+            pts[:, 2] *= 1.5 # scale Z
+            self.trajectory_line.setData(pos=pts)
