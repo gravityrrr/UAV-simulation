@@ -115,15 +115,20 @@ class UAVEnv(gym.Env):
                     t_height = max(self.heightmap[gx, gy], self.obstacles[gx, gy])
                     sensor_data[i, j] = t_height - self.uav_pos[2]
                 else:
-                    sensor_data[i, j] = 100.0 # Virtual walls
+                    sensor_data[i, j] = 50.0 # Virtual walls
                     
-        flat_sensor = sensor_data.flatten()
+        # Normalize observations to roughly [-1, 1] range to stabilize neural network
+        flat_sensor = sensor_data.flatten() / 50.0
+        norm_pos = self.uav_pos / float(self.grid_size)
+        norm_vel = self.uav_vel / self.uav_max_speed
+        norm_rel_goal = rel_goal / float(self.grid_size)
+        norm_wind = self.wind / max(1.0, self.wind_max)
         
         obs = np.concatenate([
-            self.uav_pos,
-            self.uav_vel,
-            rel_goal,
-            self.wind,
+            norm_pos,
+            norm_vel,
+            norm_rel_goal,
+            norm_wind,
             flat_sensor
         ]).astype(np.float32)
         
@@ -142,6 +147,10 @@ class UAVEnv(gym.Env):
         
         # Update physics
         self.uav_vel += effective_accel * self.dt
+        
+        # Apply air resistance / drag
+        drag_coefficient = 0.5
+        self.uav_vel -= self.uav_vel * drag_coefficient * self.dt
         
         # Speed limit
         speed = np.linalg.norm(self.uav_vel)
@@ -181,16 +190,17 @@ class UAVEnv(gym.Env):
             return self._get_obs(), reward, terminated, truncated, info
             
         # 4. Check Goal
-        dist_to_goal = np.linalg.norm(self.goal_pos - self.uav_pos)
-        if dist_to_goal < 2.0: # Reached goal radius
+        dist_to_goal_2d = np.linalg.norm(self.goal_pos[:2] - self.uav_pos[:2])
+        if dist_to_goal_2d < 3.0: # Reached goal radius
             reward += self.goal_reward
             terminated = True
             info['reason'] = 'reached_goal'
-            return self._get_obs(), reward, terminated, truncated, info
+            return self._get_obs(), float(reward), terminated, truncated, info
             
-        # Shaping: reward for moving closer to goal
+        # Shaping: reward heavily for moving closer to goal, penalize for moving away
+        dist_to_goal = np.linalg.norm(self.goal_pos - self.uav_pos)
         dist_diff = self.last_dist - dist_to_goal
-        reward += dist_diff * self.dist_reward_scale
+        reward += dist_diff * 5.0  # Increased scaling so it prioritizes reaching target
         self.last_dist = dist_to_goal
         
         # Penalty for flying too close to ground

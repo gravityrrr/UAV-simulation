@@ -2,11 +2,12 @@ import sys
 import yaml
 import os
 import time
+import numpy as np
 from PyQt6.QtWidgets import (QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, 
                              QPushButton, QLabel, QComboBox, QFormLayout, 
                              QGroupBox, QTabWidget, QSpinBox, QDoubleSpinBox, 
                              QFileDialog, QMessageBox)
-from PyQt6.QtCore import QThread, pyqtSignal, Qt
+from PyQt6.QtCore import QThread, pyqtSignal, Qt, QTimer
 
 from .map_widget import MapWidget
 from .plot_widget import TrainingPlotWidget
@@ -17,6 +18,7 @@ from agents.sac import SACAgent
 class TrainingWorker(QThread):
     update_plot_signal = pyqtSignal(float, float, float) # reward, loss, success
     update_map_signal = pyqtSignal(object, object, object, object) # pos, goal, vel, trajectory
+    update_stats_signal = pyqtSignal(int, int) # episode, steps
     setup_env_signal = pyqtSignal(object, object) # heightmap, obstacles
     finished_signal = pyqtSignal()
     
@@ -79,6 +81,7 @@ class TrainingWorker(QThread):
                 # UI Update (throttle map updates to 10 Hz)
                 if steps % 3 == 0:
                     self.update_map_signal.emit(self.env.uav_pos, self.env.goal_pos, self.env.uav_vel, self.env.trajectory)
+                    self.update_stats_signal.emit(episode, steps)
                     time.sleep(0.02) # Give UI time to process
                     
                 if terminated or truncated:
@@ -118,6 +121,15 @@ class MainWindow(QMainWindow):
             
         self.worker = None
         
+        # Manual mode state
+        self.is_manual = False
+        self.manual_env = None
+        self.manual_timer = QTimer()
+        self.manual_timer.timeout.connect(self.manual_step)
+        self.keys_pressed = set()
+        
+        self.start_time = 0
+        
         self._init_ui()
         
     def _init_ui(self):
@@ -130,6 +142,16 @@ class MainWindow(QMainWindow):
         control_panel = QWidget()
         control_panel.setFixedWidth(300)
         control_layout = QVBoxLayout(control_panel)
+        
+        # Stats Group
+        stats_group = QGroupBox("Status")
+        stats_group.setStyleSheet("color: white;")
+        stats_layout = QVBoxLayout()
+        self.stats_label = QLabel("Episode: 0\nStep: 0\nTime: 00:00")
+        self.stats_label.setStyleSheet("color: #00ffcc; font-size: 14px; font-weight: bold;")
+        stats_layout.addWidget(self.stats_label)
+        stats_group.setLayout(stats_layout)
+        control_layout.addWidget(stats_group)
         
         # Algorithm Group
         algo_group = QGroupBox("Algorithm")
@@ -166,17 +188,23 @@ class MainWindow(QMainWindow):
         # Actions
         btn_style = "QPushButton { background-color: #0078D7; color: white; padding: 8px; border-radius: 4px; font-weight: bold; } QPushButton:hover { background-color: #005A9E; }"
         stop_style = "QPushButton { background-color: #D13438; color: white; padding: 8px; border-radius: 4px; font-weight: bold; } QPushButton:hover { background-color: #A80000; }"
+        manual_style = "QPushButton { background-color: #ff8c00; color: white; padding: 8px; border-radius: 4px; font-weight: bold; } QPushButton:hover { background-color: #cc7000; }"
         
         self.start_btn = QPushButton("Start Training")
         self.start_btn.setStyleSheet(btn_style)
         self.start_btn.clicked.connect(self.start_training)
         
+        self.manual_btn = QPushButton("Start Manual Play (WASD/QE + Space)")
+        self.manual_btn.setStyleSheet(manual_style)
+        self.manual_btn.clicked.connect(self.toggle_manual_play)
+        
         self.stop_btn = QPushButton("Stop")
         self.stop_btn.setStyleSheet(stop_style)
         self.stop_btn.setEnabled(False)
-        self.stop_btn.clicked.connect(self.stop_training)
+        self.stop_btn.clicked.connect(self.stop_all)
         
         control_layout.addWidget(self.start_btn)
+        control_layout.addWidget(self.manual_btn)
         control_layout.addWidget(self.stop_btn)
         control_layout.addStretch()
         
@@ -193,8 +221,13 @@ class MainWindow(QMainWindow):
         main_layout.addWidget(control_panel)
         main_layout.addWidget(self.tabs, stretch=1)
         
+        # Timer for updating the UI clock
+        self.clock_timer = QTimer()
+        self.clock_timer.timeout.connect(self.update_clock)
+        
     def start_training(self):
-        # Update config
+        self.stop_all()
+        
         self.config['env']['terrain_roughness'] = self.rough_spin.value()
         self.config['env']['num_obstacles'] = self.obs_spin.value()
         
@@ -204,24 +237,112 @@ class MainWindow(QMainWindow):
         self.worker.update_plot_signal.connect(self.plot_widget.update_plots)
         self.worker.setup_env_signal.connect(self.map_widget.set_environment)
         self.worker.update_map_signal.connect(self.map_widget.update_state)
-        self.worker.finished_signal.connect(self.training_finished)
+        self.worker.update_stats_signal.connect(self.update_stats_label)
+        self.worker.finished_signal.connect(self.all_finished)
         
+        self.start_time = time.time()
+        self.clock_timer.start(1000)
         self.worker.start()
         
         self.start_btn.setEnabled(False)
+        self.manual_btn.setEnabled(False)
         self.stop_btn.setEnabled(True)
         self.algo_combo.setEnabled(False)
         self.tabs.setCurrentIndex(0) # Switch to map
         
-    def stop_training(self):
+    def toggle_manual_play(self):
+        if self.is_manual:
+            self.stop_all()
+        else:
+            self.stop_all()
+            self.is_manual = True
+            self.manual_btn.setText("Stop Manual Play")
+            self.start_btn.setEnabled(False)
+            self.stop_btn.setEnabled(True)
+            self.tabs.setCurrentIndex(0)
+            
+            # Setup env
+            self.config['env']['terrain_roughness'] = self.rough_spin.value()
+            self.config['env']['num_obstacles'] = self.obs_spin.value()
+            self.manual_env = UAVEnv(self.config['env'])
+            self.manual_env.reset()
+            self.map_widget.set_environment(self.manual_env.heightmap, self.manual_env.obstacles)
+            
+            self.manual_steps = 0
+            self.start_time = time.time()
+            self.clock_timer.start(1000)
+            self.manual_timer.start(50) # 20 Hz
+            self.setFocus() # needed for key events
+            
+    def manual_step(self):
+        if not self.is_manual or not self.manual_env:
+            return
+            
+        action = np.zeros(3)
+        # Assuming typical screen coordinates: Y is up/down, X is left/right
+        if Qt.Key.Key_W in self.keys_pressed: action[1] -= 1.0 # Up
+        if Qt.Key.Key_S in self.keys_pressed: action[1] += 1.0 # Down
+        if Qt.Key.Key_A in self.keys_pressed: action[0] -= 1.0 # Left
+        if Qt.Key.Key_D in self.keys_pressed: action[0] += 1.0 # Right
+        if Qt.Key.Key_Q in self.keys_pressed: action[2] += 1.0 # Ascend
+        if Qt.Key.Key_E in self.keys_pressed: action[2] -= 1.0 # Descend
+        
+        # Hard Brake
+        if Qt.Key.Key_Space in self.keys_pressed:
+            speed = np.linalg.norm(self.manual_env.uav_vel)
+            if speed > 0.1:
+                action -= (self.manual_env.uav_vel / speed) * 1.0 # Oppose velocity fully
+            else:
+                self.manual_env.uav_vel = np.zeros(3)
+        
+        _, reward, terminated, truncated, info = self.manual_env.step(action)
+        self.manual_steps += 1
+        
+        self.map_widget.update_state(self.manual_env.uav_pos, self.manual_env.goal_pos, self.manual_env.uav_vel, self.manual_env.trajectory)
+        self.update_stats_label(1, self.manual_steps)
+        
+        if terminated or truncated:
+            self.manual_timer.stop()
+            QMessageBox.information(self, "Episode Ended", f"Reason: {info['reason']}")
+            self.manual_env.reset()
+            self.map_widget.set_environment(self.manual_env.heightmap, self.manual_env.obstacles)
+            self.manual_steps = 0
+            self.manual_timer.start(50)
+            
+    def keyPressEvent(self, event):
+        if self.is_manual:
+            self.keys_pressed.add(event.key())
+        super().keyPressEvent(event)
+        
+    def keyReleaseEvent(self, event):
+        if self.is_manual and event.key() in self.keys_pressed:
+            self.keys_pressed.remove(event.key())
+        super().keyReleaseEvent(event)
+        
+    def update_stats_label(self, episode, steps):
+        elapsed = int(time.time() - self.start_time)
+        mins, secs = divmod(elapsed, 60)
+        self.stats_label.setText(f"Episode: {episode}\nStep: {steps}\nTime: {mins:02d}:{secs:02d}")
+        
+    def update_clock(self):
+        # Fallback if no steps are emitted (e.g. paused or slow)
+        pass
+
+    def stop_all(self):
         if self.worker:
             self.worker.stop()
-            self.stop_btn.setText("Stopping...")
-            self.stop_btn.setEnabled(False)
+            self.worker = None
             
-    def training_finished(self):
+        if self.is_manual:
+            self.is_manual = False
+            self.manual_timer.stop()
+            self.manual_btn.setText("Start Manual Play (WASD/QE + Space)")
+            
+        self.clock_timer.stop()
+        self.all_finished()
+            
+    def all_finished(self):
         self.start_btn.setEnabled(True)
+        self.manual_btn.setEnabled(True)
         self.stop_btn.setEnabled(False)
-        self.stop_btn.setText("Stop")
         self.algo_combo.setEnabled(True)
-        QMessageBox.information(self, "Finished", "Training stopped/finished.")

@@ -1,4 +1,5 @@
 import sys
+# pyrefly: ignore [missing-import]
 import numpy as np
 import cv2
 from PyQt6.QtWidgets import QGraphicsView, QGraphicsScene, QGraphicsPixmapItem, QGraphicsEllipseItem, QGraphicsLineItem
@@ -24,7 +25,7 @@ class MapWidget(QGraphicsView):
         self.trajectory_lines = []
         
         # Load Assets
-        self.drone_pixmap = self._load_asset("assets/drone.png", size=24)
+        self.drone_pixmap = self._load_asset("assets/jet.png", size=32)
         self.tree_pixmap = self._load_asset("assets/tree.png", size=16)
         self.custom_colormap = self._create_terrain_colormap()
         

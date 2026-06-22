@@ -48,7 +48,6 @@ class PPOAgent:
             rewards.insert(0, discounted_reward)
             
         rewards = torch.tensor(rewards, dtype=torch.float32).to(self.device)
-        rewards = (rewards - rewards.mean()) / (rewards.std() + 1e-7)
         rewards = rewards.unsqueeze(1)
         
         old_states = torch.cat(self.states).detach()
